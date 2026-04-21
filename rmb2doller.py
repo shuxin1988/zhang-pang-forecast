@@ -2,7 +2,6 @@ import streamlit as st
 import akshare as ak
 import pandas as pd
 import numpy as np
-import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
@@ -22,44 +21,72 @@ st.caption(f"数据来源：中国外汇交易中心 | 更新于 {datetime.now()
 CURRENCY = "美元"
 CURRENCY_DISPLAY = "美元 (USD)"
 
-# ---- 缓存数据获取（近一年） ----
+# ---- 侧边栏：日期范围选择 ----
+st.sidebar.header("📅 数据范围设置")
+# 默认结束日期为今天，开始日期为一年前
+default_end = datetime.now().date()
+default_start = default_end - timedelta(days=365)
+
+date_range = st.sidebar.date_input(
+    "选择起止日期",
+    value=(default_start, default_end),
+    min_value=datetime(2005, 1, 1).date(),   # 最早可查数据约在2005年
+    max_value=default_end,
+    help="选择数据的历史范围，预测将基于此范围重新计算"
+)
+
+# 处理用户输入的日期范围
+if len(date_range) == 2:
+    start_date_user, end_date_user = date_range
+    start_date_user = datetime.combine(start_date_user, datetime.min.time())
+    end_date_user = datetime.combine(end_date_user, datetime.min.time())
+else:
+    # 如果未选择完整范围，使用默认值
+    start_date_user = datetime.combine(default_start, datetime.min.time())
+    end_date_user = datetime.combine(default_end, datetime.min.time())
+
+# 确保结束日期不晚于今天
+if end_date_user.date() > datetime.now().date():
+    end_date_user = datetime.now()
+    st.sidebar.warning("结束日期不能超过今天，已自动调整为当前日期。")
+
+# 确保开始日期不晚于结束日期
+if start_date_user >= end_date_user:
+    start_date_user = end_date_user - timedelta(days=365)
+    st.sidebar.warning("起始日期不能晚于结束日期，已自动调整为结束日期前一年。")
+
+# 计算用于显示的天数
+days_selected = (end_date_user - start_date_user).days
+
+# ---- 缓存数据获取（根据用户选择的日期范围） ----
 @st.cache_data(ttl=3600)
-def load_data(currency):
-    end_date = datetime.now().strftime("%Y%m%d")
-    start_date = (datetime.now() - timedelta(days=370)).strftime("%Y%m%d")
-    df = ak.currency_boc_sina(symbol=currency, start_date=start_date, end_date=end_date)
+def load_data(currency, start_date, end_date):
+    start_str = start_date.strftime("%Y%m%d")
+    end_str = end_date.strftime("%Y%m%d")
+    df = ak.currency_boc_sina(symbol=currency, start_date=start_str, end_date=end_str)
     if df.empty:
         return pd.DataFrame()
     df = df.rename(columns={'日期': 'date', '央行中间价': 'central_parity'})
     df['date'] = pd.to_datetime(df['date'])
     df = df.sort_values('date')
-    one_year_ago = datetime.now() - timedelta(days=365)
-    df = df[df['date'] >= one_year_ago]
     return df[['date', 'central_parity']]
 
 # ---- 数据平滑处理（插值填补非交易日） ----
 def smooth_curve(df):
-    """对原始数据进行线性插值，生成连续日期序列，消除断点"""
-    if df.empty:
+    if df.empty or len(df) < 2:
         return df
-    # 创建完整的日期范围（从最早到最晚）
     full_date_range = pd.date_range(start=df['date'].min(), end=df['date'].max(), freq='D')
     df_full = pd.DataFrame({'date': full_date_range})
-    # 合并原始数据，缺失值用 NaN 表示
     df_merged = df_full.merge(df, on='date', how='left')
-    # 线性插值填充 NaN
     df_merged['central_parity'] = df_merged['central_parity'].interpolate(method='linear')
     return df_merged
 
 # ---- 未来预测（Holt-Winters 指数平滑） ----
 def forecast_future(df, periods=30):
-    """基于历史数据预测未来 periods 天的中间价"""
     if len(df) < 30:
-        return pd.DataFrame()  # 数据太少无法预测
-    # 使用插值后的数据
+        return pd.DataFrame()
     df_smooth = smooth_curve(df)
     series = df_smooth.set_index('date')['central_parity']
-    # 拟合 Holt-Winters 模型（无季节性，因中间价无明显季节性）
     model = ExponentialSmoothing(
         series,
         trend='add',
@@ -67,7 +94,6 @@ def forecast_future(df, periods=30):
         initialization_method='estimated'
     )
     fit = model.fit()
-    # 预测未来
     forecast = fit.forecast(periods)
     last_date = series.index[-1]
     future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods, freq='D')
@@ -76,23 +102,21 @@ def forecast_future(df, periods=30):
         'central_parity': forecast.values,
         'type': 'forecast'
     })
-    # 标记历史数据类型
     df_smooth['type'] = 'historical'
-    # 合并历史与预测
     combined = pd.concat([df_smooth, forecast_df], ignore_index=True)
     return combined
 
 # ---- 加载数据 ----
-with st.spinner(f"正在获取 {CURRENCY_DISPLAY} 近一年中间价数据..."):
-    df_raw = load_data(CURRENCY)
+with st.spinner(f"正在获取 {CURRENCY_DISPLAY} {start_date_user.strftime('%Y-%m-%d')} 至 {end_date_user.strftime('%Y-%m-%d')} 的中间价数据..."):
+    df_raw = load_data(CURRENCY, start_date_user, end_date_user)
 
 if df_raw.empty:
-    st.error("❌ 数据获取失败，请稍后重试或检查 AKShare 版本。")
+    st.error("❌ 所选日期范围内无数据，请调整起止日期后重试。")
 else:
     # ---- 生成预测数据 ----
     combined_df = forecast_future(df_raw, periods=30)
 
-    # ---- 显示最新中间价 ----
+    # ---- 显示最新中间价（基于所选范围的最后一天） ----
     latest_historical = df_raw.iloc[-1]
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -100,16 +124,15 @@ else:
     with col2:
         st.metric("💵 最新中间价", f"{latest_historical['central_parity']:.4f}")
     with col3:
-        # 计算近一年变化
+        # 计算所选范围内的变动
         first = df_raw.iloc[0]['central_parity']
         change = latest_historical['central_parity'] - first
         change_pct = (change / first) * 100
-        st.metric("📈 近一年变动", f"{change:+.4f}", f"{change_pct:+.2f}%")
+        st.metric("📈 区间变动", f"{change:+.4f}", f"{change_pct:+.2f}%")
 
     # ---- 绘制曲线（历史平滑线 + 预测虚线） ----
     fig = go.Figure()
 
-    # 历史平滑曲线
     hist_data = combined_df[combined_df['type'] == 'historical']
     fig.add_trace(go.Scatter(
         x=hist_data['date'],
@@ -119,7 +142,6 @@ else:
         line=dict(color='#1f77b4', width=2)
     ))
 
-    # 预测曲线（虚线）
     forecast_data = combined_df[combined_df['type'] == 'forecast']
     if not forecast_data.empty:
         fig.add_trace(go.Scatter(
@@ -130,9 +152,7 @@ else:
             line=dict(color='#ff7f0e', width=2, dash='dash')
         ))
 
-        # 添加预测置信区间（可选，这里用上下浮动简单表示）
-        last_hist_value = hist_data.iloc[-1]['central_parity']
-        # 简单估计：上下0.5%波动带
+        # 预测置信区间（上下0.5%波动）
         upper = forecast_data['central_parity'] * 1.005
         lower = forecast_data['central_parity'] * 0.995
         fig.add_trace(go.Scatter(
@@ -147,19 +167,19 @@ else:
         ))
 
     fig.update_layout(
-        title="USD/CNY 中间价走势及未来30天预测",
+        title=f"USD/CNY 中间价走势及未来30天预测（数据范围：{start_date_user.strftime('%Y-%m-%d')} 至 {end_date_user.strftime('%Y-%m-%d')}）",
         xaxis_title="日期",
         yaxis_title="中间价",
         hovermode='x unified',
         legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
     # ---- 预测数据表格 ----
     with st.expander("📋 查看未来30天预测数据"):
         st.dataframe(
             forecast_data[['date', 'central_parity']].rename(columns={'central_parity': '预测中间价'}),
-            use_container_width=True,
+            width='stretch',
             hide_index=True
         )
 
@@ -167,11 +187,11 @@ else:
     with st.expander("📋 查看原始历史数据"):
         st.dataframe(
             df_raw.sort_values('date', ascending=False),
-            use_container_width=True,
+            width='stretch',
             hide_index=True
         )
 
-    # ---- 下载按钮（包含历史+预测） ----
+    # ---- 下载按钮 ----
     csv = combined_df[['date', 'central_parity', 'type']].to_csv(index=False).encode('utf-8')
     st.download_button(
         label="⬇️ 下载全部数据 (历史+预测)",
@@ -184,8 +204,8 @@ else:
 st.sidebar.markdown("---")
 st.sidebar.info(
     "**关于数据与预测**  \n"
-    "- 历史数据来自中国外汇交易中心，通过 AKShare 获取，这里注意定义起始日期，或者写死？不然会溢出，后面看用户需求是否要增加筛选器，可以自定义起止日期。  \n"
+    "- 历史数据来自中国外汇交易中心，通过 AKShare 获取。  \n"
     "- 非交易日数据已通过线性插值平滑处理，曲线连续。  \n"
-    "- 预测采用 **Holt-Winters 指数平滑模型**，基于近一年趋势外推。置信度 0.95  \n"
+    "- 预测采用 **Holt-Winters 指数平滑模型**，基于所选历史范围外推，置信度参考 ±0.5%。  \n"
     "- 预测仅供张徇齐分析使用参考。"
 )
